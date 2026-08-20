@@ -1,0 +1,12 @@
+{
+  "name": "mini",
+  "displayName": "Mini Suite",
+  "publisher": "example",
+  "contributes": {
+    "themes": [
+      { "label": "Mini Dark", "uiTheme": "vs-dark", "path": "./themes/mini-color-theme.json" },
+      { "label": "Mini Light", "uiTheme": "vs", "path": "./themes/mini-color-theme.json" },
+      { "label": "Mini Contrast", "uiTheme": "hc-light", "path": "./themes/mini-color-theme.json" }
+    ]
+  }
+}

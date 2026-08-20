@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+#
+# vsc2zed - export VS Code color themes as a Zed theme family.
+#
+# The whole tool is one operation: point it at a theme and get a Zed theme
+# family JSON back. Where the theme comes from (marketplace, .vsix, a checkout,
+# a loose .json) is an implementation detail handled by the adapters below.
+#
+# Requires: bash, jq, awk, unzip. curl only for marketplace IDs.
+
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+LIB="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib"
+readonly LIB
+STAGE=""
+ONLY=()
+
+# --------------------------------------------------------------- output ----
+
+log()  { printf '%s\n' "$*" >&2; }
+die()  { printf 'vsc2zed: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'HELPTEXT'
+vsc2zed - export VS Code color themes as a Zed theme family
+
+USAGE
+    vsc2zed [OPTIONS] <SOURCE>...
+
+SOURCE
+    publisher.extension   download from the VS Code marketplace
+    path/to/theme.vsix    a downloaded extension package
+    path/to/extension/    an unpacked extension (a directory with package.json)
+    path/to/theme.json    a single VS Code color theme file
+
+    With no SOURCE at a terminal, vsc2zed asks.
+
+OPTIONS
+    -i, --interactive  pick from the themes installed in VS Code or Cursor
+        --list-local   list those themes and exit
+        --only GLOB    only convert themes whose name matches (repeatable)
+    -o, --out DIR      write theme families here (default: ./themes)
+        --name NAME    override the theme family name
+        --author NAME  override the theme family author
+        --appearance A force "dark" or "light" for every theme
+        --install      also copy the result into Zed's user themes directory
+        --stdout       write to stdout instead of a file
+    -q, --quiet        only report errors
+    -h, --help         show this help
+    -V, --version      show the version
+
+EXAMPLES
+    vsc2zed
+    vsc2zed MaoSantaella.night-wolf
+    vsc2zed --install dracula-theme.theme-dracula
+    vsc2zed --only '*(black)' --install MaoSantaella.night-wolf
+    vsc2zed -o build/ ~/src/my-theme/
+    vsc2zed --stdout themes/my-theme-color-theme.json > my-theme.json
+
+ENVIRONMENT
+    VSC2ZED_EXTENSION_ROOTS
+        ':'-separated extension directories to search instead of the defaults.
+        Entries are a bare path or "Label|path".
+HELPTEXT
+}
+
+# ------------------------------------------------------------- plumbing ----
+
+# Strict JSON on stdout. Comment stripping is the slow path, so only pay for it
+# when jq has already refused the file. Discovery reads hundreds of manifests,
+# so this reuses jq's parse rather than probing and then re-reading.
+strip_jsonc() {
+  local parsed
+  if parsed="$(jq -c . "$1" 2>/dev/null)"; then printf '%s\n' "$parsed"
+  else awk -f "$LIB/jsonc.awk" -- "$1"
+  fi
+}
+
+# A theme may `include` another and override parts of it, possibly in a chain.
+# Flatten that into a single self-contained theme object.
+load_theme() {
+  local file="$1" dir inc this base
+  dir="$(dirname -- "$file")"
+  this="$(strip_jsonc "$file")"
+  inc="$(printf '%s' "$this" | jq -r '.include // empty')"
+  [ -n "$inc" ] || { printf '%s' "$this"; return; }
+  base="$(load_theme "$dir/$inc")"
+  printf '%s' "$this" | jq --argjson base "$base" '
+    . as $t
+    | $base + $t
+    + { colors:              (($base.colors              // {}) + ($t.colors              // {})),
+        tokenColors:         (($base.tokenColors         // []) + ($t.tokenColors         // [])),
+        semanticTokenColors: (($base.semanticTokenColors // {}) + ($t.semanticTokenColors // {})) }
+    | del(.include)'
+}
+
+# --only patterns are case-insensitive globs anchored to the whole label, so
+# "Night Wolf (black)" selects exactly that theme and not the "(No Italics)"
+# variant whose label merely starts the same way.
+label_matches() {
+  [ "${#ONLY[@]}" -eq 0 ] && return 0
+  local label="$1" pattern matched=1
+  shopt -s nocasematch
+  for pattern in "${ONLY[@]}"; do
+    # Theme labels are full of parentheses. Escape them so bash reads
+    # "*(black)" as text rather than as an extglob group.
+    pattern="${pattern//(/\\(}"
+    pattern="${pattern//)/\\)}"
+    if [[ "$label" == $pattern ]]; then matched=0; break; fi
+  done
+  shopt -u nocasematch
+  return "$matched"
+}
+
+# Extensions often store their display name as a "%key%" reference into
+# package.nls.json. Resolve it, or the picker shows the placeholder.
+resolve_nls_name() {
+  local dir="$1" name="$2" key translated
+  case "$name" in
+    %*%) ;;
+    *) printf '%s\n' "$name"; return ;;
+  esac
+  key="${name#%}"; key="${key%\%}"
+  if [ -f "$dir/package.nls.json" ]; then
+    translated="$(strip_jsonc "$dir/package.nls.json" \
+      | jq -r --arg k "$key" '(.[$k] // empty) | if type == "object" then .message else . end')"
+    [ -n "$translated" ] && { printf '%s\n' "$translated"; return; }
+  fi
+  printf '%s\n' "$key"
+}
+
+slugify() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -e 's/[^a-z0-9]\+/-/g' -e 's/^-//' -e 's/-$//'
+}
+
+zed_themes_dir() {
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) printf '%s\n' "${APPDATA:-$HOME/AppData/Roaming}/Zed/themes" ;;
+    *)                    printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/zed/themes" ;;
+  esac
+}
+
+# ------------------------------------------------------------- adapters ----
+#
+# Every adapter resolves a SOURCE to a staging directory laid out like an
+# unpacked extension: a package.json beside the theme files it names. Past this
+# point the pipeline no longer cares where the theme came from.
+
+stage_marketplace() {
+  local id="$1" stage="$2" publisher name version url
+  command -v curl >/dev/null 2>&1 || die "curl is required to fetch '$id' from the marketplace"
+  publisher="${id%%.*}"
+  name="${id#*.}"
+  [ -n "$publisher" ] && [ -n "$name" ] && [ "$publisher" != "$id" ] \
+    || die "'$id' is not a publisher.extension identifier"
+
+  log "  fetching $id from the marketplace"
+  version="$(curl -fsS -X POST \
+      'https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery' \
+      -H 'Accept: application/json;api-version=3.0-preview.1' \
+      -H 'Content-Type: application/json' \
+      -d "{\"filters\":[{\"criteria\":[{\"filterType\":7,\"value\":\"$id\"}],\"pageSize\":1}],\"flags\":914}" \
+    | jq -r '.results[0].extensions[0].versions[0].version // empty')" \
+    || die "could not reach the marketplace"
+  [ -n "$version" ] || die "no extension published as '$id'"
+
+  url="https://marketplace.visualstudio.com/_apis/public/gallery/publishers/$publisher/vsextensions/$name/$version/vspackage"
+  curl -fsSL --compressed "$url" -o "$stage/pkg.vsix" || die "could not download $id@$version"
+  stage_vsix "$stage/pkg.vsix" "$stage"
+}
+
+stage_vsix() {
+  local vsix="$1" stage="$2"
+  command -v unzip >/dev/null 2>&1 || die "unzip is required to read .vsix packages"
+  unzip -qq -o "$vsix" -d "$stage/unpacked" || die "could not unpack $vsix"
+  printf '%s\n' "$stage/unpacked/extension"
+}
+
+stage_directory() {
+  [ -f "$1/package.json" ] || die "$1 has no package.json"
+  printf '%s\n' "$1"
+}
+
+# A loose theme file has no manifest, so synthesise the one field we need.
+stage_single_file() {
+  local file="$1" stage="$2" label
+  label="$(strip_jsonc "$file" | jq -r '.name // empty')"
+  [ -n "$label" ] || label="$(basename -- "${file%.json}" | sed 's/-color-theme$//')"
+  mkdir -p "$stage/single"
+  # Reference the file in place: copying it here would break a relative
+  # `include` pointing at a sibling theme.
+  jq -n --arg l "$label" --arg p "$(cd -- "$(dirname -- "$file")" && pwd)/$(basename -- "$file")" \
+    '{name: $l, displayName: $l, contributes: {themes: [{label: $l, path: $p}]}}' \
+    > "$stage/single/package.json"
+  printf '%s\n' "$stage/single"
+}
+
+resolve_source() {
+  local src="$1" stage="$2"
+  if   [ -d "$src" ];                     then stage_directory "$src"
+  elif [ -f "$src" ] && [[ "$src" == *.vsix ]]; then stage_vsix "$src" "$stage"
+  elif [ -f "$src" ];                     then stage_single_file "$src" "$stage"
+  elif [[ "$src" == *.*  ]];              then stage_marketplace "$src" "$stage"
+  else die "no such theme source: $src"
+  fi
+}
+
+# ------------------------------------------------------------- pipeline ----
+
+# An unpacked extension -> one Zed theme family on stdout.
+build_family() {
+  local ext="$1" family_name="$2" family_author="$3" appearance="$4"
+  local manifest count i label rel file theme_name theme_appearance
+
+  manifest="$(strip_jsonc "$ext/package.json")"
+  count="$(printf '%s' "$manifest" | jq '(.contributes.themes // []) | length')"
+  [ "$count" -gt 0 ] || die "$ext/package.json contributes no themes"
+
+  [ -n "$family_name" ]   || family_name="$(resolve_nls_name "$ext" \
+      "$(printf '%s' "$manifest" | jq -r '.displayName // .name // "VS Code Theme"')")"
+  [ -n "$family_author" ] || family_author="$(printf '%s' "$manifest" | jq -r '.publisher // .author.name? // .author? // "unknown"')"
+
+  local themes=()
+  for (( i = 0; i < count; i++ )); do
+    label="$(printf '%s' "$manifest" | jq -r ".contributes.themes[$i].label // empty")"
+    rel="$(printf '%s'   "$manifest" | jq -r ".contributes.themes[$i].path")"
+    theme_appearance="$appearance"
+    if [ -z "$theme_appearance" ]; then
+      case "$(printf '%s' "$manifest" | jq -r ".contributes.themes[$i].uiTheme // empty")" in
+        vs|hc-light)      theme_appearance="light" ;;
+        vs-dark|hc-black) theme_appearance="dark" ;;
+      esac
+    fi
+
+    case "$rel" in /*) file="$rel" ;; *) file="$ext/${rel#./}" ;; esac
+    [ -f "$file" ] || { log "  skipping missing theme file $rel"; continue; }
+
+    # The label in package.json is authoritative: many extensions leave a
+    # placeholder in the theme file's own `name` field.
+    theme_name="$label"
+    [ -n "$theme_name" ] || theme_name="$(strip_jsonc "$file" | jq -r '.name // "Untitled"')"
+
+    label_matches "$theme_name" || continue
+
+    log "  - $theme_name"
+    local converted
+    converted="$(load_theme "$file" \
+      | jq -L "$LIB" --arg name "$theme_name" --arg appearance "$theme_appearance" \
+            -f "$LIB/convert.jq")" || die "could not convert $rel"
+    [ -n "$converted" ] || die "could not convert $rel"
+    themes+=("$converted")
+  done
+
+  if [ "${#themes[@]}" -eq 0 ]; then
+    [ "${#ONLY[@]}" -eq 0 ] && die "no themes could be converted from $ext"
+    die "--only matched none of the themes in $ext"
+  fi
+
+  printf '%s\n' "${themes[@]}" | jq -s \
+    --arg name "$family_name" --arg author "$family_author" \
+    '{ "$schema": "https://zed.dev/schema/themes/v0.2.0.json",
+       name: $name, author: $author, themes: . }'
+}
+
+# ----------------------------------------------------------------- main ----
+
+main() {
+  local out_dir="themes" family_name="" family_author="" appearance=""
+  local do_install=0 to_stdout=0 quiet=0 interactive=0 list_only=0
+  local sources=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -i|--interactive) interactive=1; shift ;;
+      --list-local) list_only=1; shift ;;
+      --only)       ONLY+=("${2:?--only needs a pattern}"); shift 2 ;;
+      -o|--out)     out_dir="${2:?--out needs a directory}"; shift 2 ;;
+      --name)       family_name="${2:?--name needs a value}"; shift 2 ;;
+      --author)     family_author="${2:?--author needs a value}"; shift 2 ;;
+      --appearance) appearance="${2:?--appearance needs dark or light}"; shift 2 ;;
+      --install)    do_install=1; shift ;;
+      --stdout)     to_stdout=1; shift ;;
+      -q|--quiet)   quiet=1; shift ;;
+      -h|--help)    usage; return 0 ;;
+      -V|--version) printf 'vsc2zed %s\n' "$VERSION"; return 0 ;;
+      --)           shift; sources+=("$@"); break ;;
+      -*)           die "unknown option: $1" ;;
+      *)            sources+=("$1"); shift ;;
+    esac
+  done
+
+  case "$appearance" in ''|dark|light) ;; *) die "--appearance must be dark or light" ;; esac
+  command -v jq >/dev/null 2>&1 || die "jq is required (https://jqlang.github.io/jq/)"
+
+  # With no arguments at a terminal, asking is friendlier than printing usage.
+  if [ "${#sources[@]}" -eq 0 ] && [ "$list_only" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+    interactive=1
+  fi
+  [ "$quiet" -eq 1 ] && [ "$interactive" -eq 1 ] && die "--quiet and --interactive do not mix"
+  [ "$quiet" -eq 1 ] && exec 2>/dev/null
+
+  local ext family slug target
+  # STAGE is global: the EXIT trap outlives main's locals.
+  STAGE="$(mktemp -d "${TMPDIR:-/tmp}/vsc2zed.XXXXXX")"
+  trap 'rm -rf -- "${STAGE:-}"' EXIT
+
+  if [ "$list_only" -eq 1 ] || [ "$interactive" -eq 1 ]; then
+    # shellcheck source=lib/interactive.sh
+    . "$LIB/interactive.sh"
+  fi
+  if [ "$list_only" -eq 1 ]; then list_local; return 0; fi
+  if [ "$interactive" -eq 1 ]; then
+    prompt_interactive || return 0
+    # Writing straight into Zed's themes directory is what installing means.
+    if [ "$do_install" -eq 1 ]; then out_dir="$(zed_themes_dir)"; do_install=0; fi
+  fi
+
+  [ "${#sources[@]}" -gt 0 ] || { usage >&2; return 2; }
+
+  for src in "${sources[@]}"; do
+    log "converting $src"
+    ext="$(resolve_source "$src" "$STAGE")"
+    family="$(build_family "$ext" "$family_name" "$family_author" "$appearance")"
+
+    if [ "$to_stdout" -eq 1 ]; then
+      printf '%s\n' "$family"
+    else
+      slug="$(slugify "$(printf '%s' "$family" | jq -r '.name')")"
+      mkdir -p "$out_dir"
+      target="$out_dir/$slug.json"
+      printf '%s\n' "$family" > "$target"
+      log "wrote $target"
+      if [ "$do_install" -eq 1 ]; then
+        mkdir -p "$(zed_themes_dir)"
+        cp -- "$target" "$(zed_themes_dir)/$slug.json"
+        log "installed $(zed_themes_dir)/$slug.json"
+      fi
+    fi
+    rm -rf -- "${STAGE:?}/unpacked" "${STAGE:?}/single" "${STAGE:?}/pkg.vsix"
+  done
+
+  if [ "$interactive" -eq 1 ] && [ "$to_stdout" -eq 0 ]; then
+    log ""
+    log "Restart Zed, then pick the theme with the theme selector (ctrl-k ctrl-t)."
+  fi
+}
+
+main "$@"

@@ -1,0 +1,8 @@
+{
+  "name": "nlsdemo",
+  "displayName": "%ext.displayName%",
+  "publisher": "example",
+  "contributes": {
+    "themes": [ { "label": "NLS Theme", "uiTheme": "vs-dark", "path": "./themes/mini-color-theme.json" } ]
+  }
+}

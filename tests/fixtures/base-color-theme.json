@@ -1,0 +1,6 @@
+{
+  "name": "Base",
+  "type": "dark",
+  "colors": { "editor.background": "#000000", "editor.foreground": "#ffffff", "focusBorder": "#ff0000" },
+  "tokenColors": [ { "scope": "comment", "settings": { "foreground": "#444444" } } ]
+}

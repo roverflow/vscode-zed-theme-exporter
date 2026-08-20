@@ -1,0 +1,6 @@
+{
+  "include": "./base-color-theme.json",
+  "name": "Derived",
+  "colors": { "editor.background": "#111111" },
+  "tokenColors": [ { "scope": "keyword", "settings": { "foreground": "#00ff00" } } ]
+}
